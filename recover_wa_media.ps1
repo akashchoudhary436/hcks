@@ -1,11 +1,47 @@
 param(
-    [string]$Root   = ".",
-    [string]$OutDir = (Join-Path (Get-Location) ("recovered_wa_media_" + (Get-Date -Format "yyyyMMdd_HHmmss")))
+    [string]$OutSuffix = (Get-Date -Format "yyyyMMdd_HHmmss")
 )
 
 $ErrorActionPreference = "SilentlyContinue"
 
-foreach ($n in @("chrome","msedge","brave","chromedriver")) {
+# -- 1. Script's own folder (output goes here) --
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+if (-not $ScriptDir) { $ScriptDir = (Get-Location).Path }
+
+# -- 2. Find Chrome's WhatsApp IndexedDB folders FIRST --
+Write-Host "Searching for WhatsApp IndexedDB..." -ForegroundColor Cyan
+$candidates = @()
+$chromeRoot = "$env:LOCALAPPDATA\Google\Chrome\User Data"
+if (Test-Path $chromeRoot) {
+    Get-ChildItem $chromeRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        $p = Join-Path $_.FullName "IndexedDB"
+        if (Test-Path $p) { $candidates += $p }
+    }
+}
+
+$srcRoot = $null
+foreach ($c in $candidates) {
+    $b = Join-Path $c "https_web.whatsapp.com_0.indexeddb.blob"
+    $d = Join-Path $c "https_web.whatsapp.com_0.indexeddb.leveldb"
+    if ((Test-Path $b) -and (Test-Path $d)) { $srcRoot = $c; break }
+}
+
+if (-not $srcRoot) {
+    Write-Host "WhatsApp IndexedDB not found in Chrome profiles." -ForegroundColor Red
+    Write-Host "Searched:" -ForegroundColor Gray
+    $candidates | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray }
+    Write-Host "Finished" -ForegroundColor Yellow
+    exit 1
+}
+
+Write-Host "Found: $srcRoot" -ForegroundColor Green
+
+$waBlob = Join-Path $srcRoot "https_web.whatsapp.com_0.indexeddb.blob"
+$waDb   = Join-Path $srcRoot "https_web.whatsapp.com_0.indexeddb.leveldb"
+
+# -- 3. NOW kill Chrome --
+Write-Host "Killing Chrome..." -ForegroundColor Yellow
+foreach ($n in @("chrome","chromedriver")) {
     $p = Get-Process -Name $n -ErrorAction SilentlyContinue
     if ($p) { $p | ForEach-Object { try { $_.Kill() } catch {} } }
 }
@@ -14,16 +50,16 @@ if (Get-Process -Name chrome -ErrorAction SilentlyContinue) {
     Stop-Process -Name chrome -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 3
 }
+Write-Host "Chrome closed." -ForegroundColor Green
 
-$waBlob = Join-Path $Root "https_web.whatsapp.com_0.indexeddb.blob"
-$waDb   = Join-Path $Root "https_web.whatsapp.com_0.indexeddb.leveldb"
-if (-not (Test-Path $waDb) -or -not (Test-Path $waBlob)) { exit 1 }
-
+# -- 4. Output folder next to script --
+$OutDir = Join-Path $ScriptDir ("recovered_wa_media_" + $OutSuffix)
 $dirImages = Join-Path $OutDir "images"
 $dirVideos = Join-Path $OutDir "videos"
 $dirGifs   = Join-Path $OutDir "gifs"
 foreach ($d in @($dirImages,$dirVideos,$dirGifs)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
 
+# ============================================================
 function Read-LevelDB {
     param([string]$Folder)
     $entries = @{}
@@ -82,27 +118,6 @@ function Read-LevelDB {
         } catch {}
     }
     return $entries
-}
-
-$db = Read-LevelDB -Folder $waDb
-
-$keys = @(); $seen = @{}
-foreach ($k in $db.Keys) {
-    $v = $db[$k]
-    if ($v.Length -eq 32) {
-        $h = [BitConverter]::ToString($v)
-        if (-not $seen.ContainsKey($h)) { $seen[$h]=$true; $keys += ,$v }
-    }
-    if ($v.Length -ge 48) {
-        for ($off=0; $off -le ($v.Length-32); $off++) {
-            $w = $v[$off..($off+31)]
-            $u=@{}; foreach ($b in $w) { $u[$b]=$true }
-            if ($u.Count -ge 26) {
-                $h = [BitConverter]::ToString($w)
-                if (-not $seen.ContainsKey($h)) { $seen[$h]=$true; $keys += ,$w }
-            }
-        }
-    }
 }
 
 function HKDF-Expand([byte[]]$Prk,[byte[]]$Info,[int]$Len) {
@@ -170,6 +185,31 @@ function Get-Type([byte[]]$b) {
     return @($null,$null)
 }
 
+# -- 5. Read leveldb (keys) AFTER Chrome is dead --
+Write-Host "Extracting keys..." -ForegroundColor Cyan
+$db = Read-LevelDB -Folder $waDb
+$keys = @(); $seen = @{}
+foreach ($k in $db.Keys) {
+    $v = $db[$k]
+    if ($v.Length -eq 32) {
+        $h = [BitConverter]::ToString($v)
+        if (-not $seen.ContainsKey($h)) { $seen[$h]=$true; $keys += ,$v }
+    }
+    if ($v.Length -ge 48) {
+        for ($off=0; $off -le ($v.Length-32); $off++) {
+            $w = $v[$off..($off+31)]
+            $u=@{}; foreach ($b in $w) { $u[$b]=$true }
+            if ($u.Count -ge 26) {
+                $h = [BitConverter]::ToString($w)
+                if (-not $seen.ContainsKey($h)) { $seen[$h]=$true; $keys += ,$w }
+            }
+        }
+    }
+}
+Write-Host "Key candidates: $($keys.Count)" -ForegroundColor Green
+
+# -- 6. Decrypt blobs --
+Write-Host "Decrypting blobs..." -ForegroundColor Cyan
 Get-ChildItem $waBlob -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
     try {
         $enc = [IO.File]::ReadAllBytes($_.FullName)
@@ -193,6 +233,8 @@ Get-ChildItem $waBlob -Recurse -File -ErrorAction SilentlyContinue | ForEach-Obj
     } catch {}
 }
 
+# -- 7. Embedded leveldb media --
+Write-Host "Scanning leveldb for embedded media..." -ForegroundColor Cyan
 Get-ChildItem $waDb -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
     try {
         $b = [IO.File]::ReadAllBytes($_.FullName)
@@ -228,6 +270,7 @@ Get-ChildItem $waDb -Recurse -File -ErrorAction SilentlyContinue | ForEach-Objec
     } catch {}
 }
 
+# -- 8. Merge split videos --
 $groups = @{}
 foreach ($f in Get-ChildItem $dirVideos -File -ErrorAction SilentlyContinue) {
     if ($f.BaseName -match '^(\d+)') {
@@ -257,6 +300,7 @@ foreach ($g in $groups.GetEnumerator()) {
     }
 }
 
+# -- 9. Cleanup empty dirs + summary --
 foreach ($d in @($dirImages,$dirVideos,$dirGifs)) {
     if ((Get-ChildItem $d -File -ErrorAction SilentlyContinue).Count -eq 0) {
         Remove-Item $d -Force -ErrorAction SilentlyContinue
@@ -273,3 +317,6 @@ Write-Host "GIFs   : $((Get-ChildItem $dirGifs   -File -EA SilentlyContinue).Cou
 Write-Host "Total  : $($all.Count) files, $size MB"
 
 if ($all.Count -gt 0) { Start-Process explorer.exe $OutDir }
+
+Write-Host ""
+Write-Host "Finished" -ForegroundColor Green
