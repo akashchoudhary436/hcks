@@ -1,19 +1,15 @@
 <# ------------------------------------------------------------------
    WhatsApp Media Recovery (PowerShell v7)
    --------------------------------------
-   • Kills Chrome & Chrome‑Driver processes.
-   • Enumerates Chrome profiles that contain WhatsApp data.
-   • Extracts media keys from IndexedDB log files.
-   • Scans all relevant folders (IndexedDB, ServiceWorker Cache, etc.).
-   • Decrypts encrypted blobs when a key is found.
-   • Copies complete images / GIFs / videos to a local folder.
-   • No webhook – all files are saved locally, **in the folder you run this script from**.
+   • No webhook – everything is saved locally.
+   • Output folder: <current‑folder>/recovered_wa_media
+   • Works on Windows 10/11 with PowerShell 7
    --------------------------------------
    Author: HackerGPT (OpenAI) – adapted by user
    ------------------------------------------------------------------#>
 
 param(
-    # Optional: override the output folder name (sub‑folder inside current directory)
+    # Optional: override the output folder name
     [string]$OutFolderName = "recovered_wa_media"
 )
 
@@ -34,7 +30,6 @@ if (Get-Process -Name chrome -ErrorAction SilentlyContinue) {
 # ------------------------------------------------------------------
 # 2.  Find Chrome profiles that contain WhatsApp data
 # ------------------------------------------------------------------
-#   * Use the **current working directory** – not the script's folder
 $ScriptDir = (Get-Location).Path
 
 $chromeRoots   = @()
@@ -59,8 +54,9 @@ $waDbDirs    = @()
 $waBlobDirs  = @()
 
 foreach ($root in $chromeRoots) {
-    $db  = Join-Path $root "IndexedDB\https_web.whatsapp.com_0.indexeddb.leveldb"
+    $db   = Join-Path $root "IndexedDB\https_web.whatsapp.com_0.indexeddb.leveldb"
     $blob = Join-Path $root "IndexedDB\https_web.whatsapp.com_0.indexeddb.blob"
+
     if (Test-Path $db)   { $waDbDirs   += $db; $searchPaths += $db }
     if (Test-Path $blob) { $waBlobDirs += $blob; $searchPaths += $blob }
 
@@ -138,7 +134,7 @@ public class WaHelper {
                     }
                     if (ext != null) {
                         string dir = cat == "images" ? dirImages : (cat == "videos" ? dirVideos : dirGifs);
-                        string fn = $"{cat.Substring(0,3)}_{Guid.NewGuid().ToString("N").Substring(0,8)}.{ext}";
+                        string fn = cat.Substring(0,3) + "_" + Guid.NewGuid().ToString("N").Substring(0,8) + "." + ext;
                         File.WriteAllBytes(Path.Combine(dir, fn), dec);
                         return 1;   // we saved one file – stop further processing
                     }
@@ -159,7 +155,7 @@ public class WaHelper {
                 if (end > pos + 100) {
                     byte[] slice = new byte[end - pos + 1];
                     Array.Copy(b, pos, slice, 0, slice.Length);
-                    string fn = $"img_{Guid.NewGuid().ToString("N").Substring(0,8)}.jpg";
+                    string fn = "img_" + Guid.NewGuid().ToString("N").Substring(0,8) + ".jpg";
                     File.WriteAllBytes(Path.Combine(dirImages, fn), slice);
                     saved++; pos = end + 1; continue;
                 }
@@ -169,7 +165,7 @@ public class WaHelper {
                 int len = Math.Min(3000000, b.Length - pos); // 3 MB slice
                 byte[] slice = new byte[len];
                 Array.Copy(b, pos, slice, 0, len);
-                string fn = $"img_{Guid.NewGuid().ToString("N").Substring(0,8)}.png";
+                string fn = "img_" + Guid.NewGuid().ToString("N").Substring(0,8) + ".png";
                 File.WriteAllBytes(Path.Combine(dirImages, fn), slice);
                 saved++; pos += len; continue;
             }
@@ -178,7 +174,7 @@ public class WaHelper {
                 int len = Math.Min(3000000, b.Length - pos);
                 byte[] slice = new byte[len];
                 Array.Copy(b, pos, slice, 0, len);
-                string fn = $"gif_{Guid.NewGuid().ToString("N").Substring(0,8)}.gif";
+                string fn = "gif_" + Guid.NewGuid().ToString("N").Substring(0,8) + ".gif";
                 File.WriteAllBytes(Path.Combine(dirGifs, fn), slice);
                 saved++; pos += len; continue;
             }
@@ -195,7 +191,7 @@ public class WaHelper {
                     string ext = "mp4";
                     if (brand.StartsWith("qt")) ext = "mov";
                     else if (brand.StartsWith("3gp")) ext = "3gp";
-                    string fn = $"vid_{Guid.NewGuid().ToString("N").Substring(0,8)}.{ext}";
+                    string fn = "vid_" + Guid.NewGuid().ToString("N").Substring(0,8) + "." + ext;
                     File.WriteAllBytes(Path.Combine(dirVideos, fn), slice);
                     saved++; break;   // stop scanning – we captured a full video
                 }
@@ -224,7 +220,7 @@ public class WaHelper {
                             else if (dec.Length > 12 && dec[4] == 0x66 && dec[5] == 0x74) { ext = "mp4"; cat = "videos"; }
                             if (ext != null) {
                                 string dir = cat == "images" ? dirImages : (cat == "videos" ? dirVideos : dirGifs);
-                                string fn = $"{cat.Substring(0,3)}_{Guid.NewGuid().ToString("N").Substring(0,8)}.{ext}";
+                                string fn = cat.Substring(0,3) + "_" + Guid.NewGuid().ToString("N").Substring(0,8) + "." + ext;
                                 File.WriteAllBytes(Path.Combine(dir, fn), dec);
                                 saved++; break;
                             }
@@ -303,64 +299,4 @@ $keys = @()
 $seen = @{}
 foreach ($dbDir in $waDbDirs) {
     $logFiles = Get-ChildItem $dbDir -Filter "*.log" -File -ErrorAction SilentlyContinue
-    foreach ($f in $logFiles) {
-        try {
-            $found = [WaHelper]::ExtractKeys($f.FullName)
-            foreach ($k in $found) {
-                $h = [BitConverter]::ToString($k)
-                if (-not $seen.ContainsKey($h)) {
-                    $seen[$h] = $true
-                    $keys += ,$k
-                }
-            }
-        } catch {}
-    }
-}
-
-# ------------------------------------------------------------------
-# 7.  Scan all relevant paths
-# ------------------------------------------------------------------
-$totalImages = 0
-$totalVideos = 0
-$totalGifs   = 0
-
-foreach ($sp in $searchPaths) {
-    # Relaxed size filter: keep files up to 200 MB
-    $files = Get-ChildItem $sp -Recurse -File -ErrorAction SilentlyContinue |
-             Where-Object { $_.Length -gt 100 -and $_.Length -lt 200MB }
-
-    if ($files.Count -eq 0) { continue }
-
-    $isDbDir   = $waDbDirs   -contains $sp
-    $isBlobDir = $waBlobDirs -contains $sp
-
-    foreach ($f in $files) {
-        try {
-            $cnt = [WaHelper]::ScanFileForMedia(
-                $f.FullName,
-                $dirImages,
-                $dirVideos,
-                $dirGifs,
-                ($isDbDir -or $isBlobDir),     # try decryption only for DB/Blob dirs
-                [System.Collections.Generic.List[byte[]]]$keys,
-                $isBlobDir
-            )
-            if ($cnt -gt 0) {
-                # Count how many files we just wrote
-                $totalImages += ($cnt - 0)  # images are counted inside ScanFileForMedia
-                $totalVideos += ($cnt - 0)  # videos are counted inside ScanFileForMedia
-                $totalGifs   += ($cnt - 0)
-            }
-        } catch {}
-    }
-}
-
-# ------------------------------------------------------------------
-# 8.  Summary
-# ------------------------------------------------------------------
-Write-Host "`n✅  Media recovery finished."
-Write-Host "Images  : $totalImages"
-Write-Host "Videos  : $totalVideos"
-Write-Host "GIFs    : $totalGifs"
-Write-Host "All files are saved in: $OutDir"
-Write-Host "Finished."
+    foreach ($
